@@ -1,18 +1,63 @@
 #pragma once
 
+/*
+ * Platform-independent MQ-135 air quality gas sensor driver (Dependency Inversion).
+ *
+ * The driver depends ONLY on the abstract ADC interface mq135_adc_t defined
+ * below and includes only standard C headers. Any ADC implementation whose
+ * functions match the mq135_adc_*_fn signatures can be plugged in, e.g. the
+ * generic ESP-IDF ADC adapter (esp32_adc_adapter.h in esp32_adapters):
+ *
+ *   mq135_adc_t field | ESP-IDF adapter symbol | handle type behind void*
+ *   ------------------+------------------------+-------------------------
+ *   handle            | &adc_ctx               | esp32_adc_ctx_t *
+ *   read_raw          | esp32_adc_read_raw     |
+ *   read_mv           | esp32_adc_read_mv      |
+ */
+
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#include "esp_err.h"
-#include "esp_adc/adc_oneshot.h"
-#include "driver/gpio.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#define MQ135_DEFAULT_VCC_MV          3300.0f /**< Default divider supply voltage [mV] */
+#define MQ135_DEFAULT_CLEAN_AIR_RATIO 3.6f    /**< Rs/R0 ratio in clean air (~400 ppm CO2, MQ-135 datasheet) */
+
 /**
- * @brief Operating state of the MQ-135 sensor
+ * @brief Read raw ADC count from the channel connected to the sensor
+ * @return 0 on success, negative value on error
  */
+typedef int (*mq135_adc_read_raw_fn)(void *handle, int *out_raw);
+
+/**
+ * @brief Read calibrated voltage in millivolts [mV] from the ADC channel
+ * @return 0 on success, negative value on error
+ */
+typedef int (*mq135_adc_read_mv_fn)(void *handle, int *out_mv);
+
+/**
+ * @brief ADC interface injected into the MQ-135 driver
+ */
+typedef struct {
+    void *handle;                   /**< Opaque ADC handle passed unchanged to callbacks */
+    mq135_adc_read_raw_fn read_raw; /**< Optional: raw ADC read (may be NULL) */
+    mq135_adc_read_mv_fn  read_mv;  /**< Required: calibrated voltage read in [mV] */
+} mq135_adc_t;
+
+/** Platform-independent result codes of the MQ-135 driver */
+typedef enum {
+    MQ135_OK                =  0,
+    MQ135_ERR_NULL          = -1, /**< NULL pointer argument or missing read_mv callback */
+    MQ135_ERR_INVALID_ARG   = -2, /**< Invalid configuration parameter or samples == 0 */
+    MQ135_ERR_INVALID_STATE = -3, /**< Driver not initialized or R0 not calibrated */
+    MQ135_ERR_ADC           = -4, /**< ADC adapter returned a read error */
+    MQ135_ERR_OUT_OF_RANGE  = -5  /**< Measured voltage out of divider range (<= 0 or >= vcc_mv) */
+} mq135_err_t;
+
+/** Operating state of the MQ-135 sensor */
 typedef enum {
     MQ135_STATE_UNINITIALIZED = 0, /**< Sensor is not initialized */
     MQ135_STATE_PREHEATING,        /**< Sensor heater is preheating */
@@ -20,102 +65,67 @@ typedef enum {
     MQ135_STATE_ERROR              /**< Sensor error state */
 } mq135_state_t;
 
-/**
- * @brief Configuration structure for the MQ-135 sensor
- */
+/** Configuration structure for the MQ-135 sensor (platform-agnostic) */
 typedef struct {
-    adc_unit_t adc_unit;          /**< ADC unit (e.g., ADC_UNIT_1) */
-    adc_channel_t adc_channel;    /**< ADC channel connected to the sensor analog output */
-    gpio_num_t heater_pin;        /**< GPIO pin controlling the heater (GPIO_NUM_NC if always powered) */
-    float rl_kohm;                /**< Load resistance RL [kOhm] */
-    float r0_kohm;                /**< Base resistance R0 in clean air [kOhm] */
-    uint32_t preheat_time_ms;     /**< Required heater preheat time [ms] */
+    float vcc_mv;             /**< Circuit supply voltage Vcc [mV] (0 -> MQ135_DEFAULT_VCC_MV) */
+    float rl_kohm;            /**< Load resistance RL [kOhm] (must be > 0) */
+    float r0_kohm;            /**< Base resistance R0 in clean air [kOhm] (can be set by mq135_calibrate) */
+    float clean_air_ratio;    /**< Rs/R0 ratio in clean air (0 -> MQ135_DEFAULT_CLEAN_AIR_RATIO) */
+    uint32_t preheat_time_ms; /**< Nominal heater preheat time [ms] (informational) */
 } mq135_config_t;
 
-/**
- * @brief Measurement data structure for the MQ-135 sensor
- */
+/** Measurement data structure for the MQ-135 sensor */
 typedef struct {
-    int raw_adc;                  /**< Raw ADC reading */
-    float voltage_mv;             /**< Sensor output voltage [mV] */
-    float rs_kohm;                /**< Current sensor resistance Rs [kOhm] */
-    float corrected_rs_kohm;      /**< Temperature and humidity compensated resistance Rs [kOhm] */
-    float ratio_rs_r0;            /**< Resistance ratio Rs/R0 */
-    float ppm_co2;                /**< Estimated equivalent CO2 / air pollutant concentration [ppm] */
-    uint16_t aqi;                 /**< Estimated Air Quality Index (AQI) */
+    int raw_adc;             /**< Raw ADC reading (0 if read_raw callback is not provided) */
+    float voltage_mv;        /**< Sensor output voltage [mV] */
+    float rs_kohm;           /**< Current sensor resistance Rs [kOhm] */
+    float corrected_rs_kohm; /**< Temperature and humidity compensated resistance Rs [kOhm] */
+    float ratio_rs_r0;       /**< Resistance ratio Rs_corr/R0 */
+    float ppm_co2;           /**< Estimated equivalent CO2 / air pollutant concentration [ppm] */
+    uint16_t aqi;            /**< Estimated Air Quality Index (AQI) */
 } mq135_data_t;
 
-/**
- * @brief Main descriptor structure representing an MQ-135 sensor instance
- */
+/** Main descriptor structure representing an MQ-135 sensor instance */
 typedef struct {
-    mq135_config_t config;                /**< Hardware and calibration configuration */
-    mq135_state_t state;                  /**< Current operating state */
-    mq135_data_t last_data;               /**< Most recent measurement data */
-    adc_oneshot_unit_handle_t adc_handle; /**< ADC oneshot unit handle */
-    bool initialized;                     /**< Initialization status flag */
+    mq135_adc_t adc;        /**< Injected ADC interface */
+    mq135_config_t config;  /**< Sensor circuit and calibration configuration */
+    mq135_state_t state;    /**< Current operating state */
+    mq135_data_t last_data; /**< Most recent measurement data */
+    bool initialized;       /**< Initialization status flag */
 } mq135_sensor_t;
 
-/**
- * @brief Initialize the MQ-135 sensor (facade: configures ADC, heater GPIO, and initial state)
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @param[in] config Pointer to the configuration structure
- * @return esp_err_t ESP_OK on success
- */
-esp_err_t mq135_init(mq135_sensor_t *sensor, const mq135_config_t *config);
+typedef mq135_sensor_t mq135_dev_t;
 
 /**
- * @brief Deinitialize the MQ-135 sensor and release hardware resources
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @return esp_err_t ESP_OK on success
+ * @brief Initialize the MQ-135 sensor descriptor and bind the abstract ADC interface
  */
-esp_err_t mq135_deinit(mq135_sensor_t *sensor);
+mq135_err_t mq135_init(mq135_sensor_t *sensor, const mq135_adc_t *adc, const mq135_config_t *config);
 
 /**
- * @brief Calibrate the MQ-135 sensor in clean air (determines base resistance R0)
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @param[in] samples Number of samples to average during calibration
- * @return esp_err_t ESP_OK on success
+ * @brief Deinitialize the MQ-135 sensor descriptor (does not release the ADC adapter)
  */
-esp_err_t mq135_calibrate(mq135_sensor_t *sensor, uint16_t samples);
+mq135_err_t mq135_deinit(mq135_sensor_t *sensor);
 
 /**
- * @brief Retrieve processed measurement data from the MQ-135 sensor without environmental compensation
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @param[out] out_data Pointer to the structure where measurement results will be stored
- * @return esp_err_t ESP_OK on success
+ * @brief Calibrate the MQ-135 sensor in clean air (measures Rs over @p samples and updates r0_kohm)
  */
-esp_err_t mq135_get_data(mq135_sensor_t *sensor, mq135_data_t *out_data);
+mq135_err_t mq135_calibrate(mq135_sensor_t *sensor, uint16_t samples);
 
 /**
- * @brief Retrieve measurement data from the MQ-135 sensor with temperature and humidity compensation (e.g., from BME280)
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @param[in] temperature_c Ambient temperature [°C]
- * @param[in] humidity_rh Relative humidity [% RH]
- * @param[out] out_data Pointer to the structure where measurement results will be stored
- * @return esp_err_t ESP_OK on success
+ * @brief Retrieve processed measurement data using reference conditions (20 °C, 33 %RH)
  */
-esp_err_t mq135_get_compensated_data(mq135_sensor_t *sensor, float temperature_c, float humidity_rh, mq135_data_t *out_data);
+mq135_err_t mq135_get_data(mq135_sensor_t *sensor, mq135_data_t *out_data);
 
 /**
- * @brief Enable or disable the MQ-135 sensor heater
- *
- * @param[in,out] sensor Pointer to the MQ-135 sensor descriptor
- * @param[in] enable true to enable the heater, false to disable
- * @return esp_err_t ESP_OK on success
+ * @brief Retrieve measurement data with temperature and humidity compensation (e.g. from BME280)
  */
-esp_err_t mq135_set_heater(mq135_sensor_t *sensor, bool enable);
+mq135_err_t mq135_get_compensated_data(mq135_sensor_t *sensor,
+                                       float temperature_c,
+                                       float humidity_rh,
+                                       mq135_data_t *out_data);
 
 /**
- * @brief Check whether the MQ-135 sensor is ready to take measurements
- *
- * @param[in] sensor Pointer to the MQ-135 sensor descriptor
- * @return true if the sensor is initialized and preheated, false otherwise
+ * @brief Check whether the MQ-135 sensor is initialized and ready to take measurements
  */
 bool mq135_is_ready(const mq135_sensor_t *sensor);
 

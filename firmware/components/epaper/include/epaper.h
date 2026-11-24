@@ -324,6 +324,30 @@ esp_err_t epaper_display_string(epaper_display_t *display,
  */
 esp_err_t epaper_sleep(epaper_display_t *display, epaper_sleep_mode_t sleep_mode);
 
+/** Error codes for float_to_str_1dec() */
+#define FLOAT_TO_STR_ERR_INVALID_ARG   (-1) /**< NULL pointer or buf_size == 0 */
+#define FLOAT_TO_STR_ERR_NAN           (-2) /**< Value is NaN (buf receives "nan" if buf_size >= 4) */
+#define FLOAT_TO_STR_ERR_INF           (-3) /**< Value is +/-Inf (buf receives "inf"/"-inf" if fits) */
+#define FLOAT_TO_STR_ERR_OVERFLOW      (-4) /**< Magnitude too large to format */
+#define FLOAT_TO_STR_ERR_BUF_TOO_SMALL (-5) /**< Output buffer too small to store formatted string */
+
+/**
+ * @brief Efficient and safe conversion of a float to a null-terminated string
+ *        with exactly 1 decimal place (embedded / bare-metal friendly).
+ *
+ * - Rounding: round-half-away-from-zero (e.g. 12.34 -> "12.3", 12.36 -> "12.4", 9.96 -> "10.0")
+ * - Small negative values rounding to 0 are formatted without '-' (e.g. -0.04 -> "0.0")
+ * - Decimal separator: '.'
+ * - No dynamic memory allocation or stdio (sprintf/snprintf) used.
+ * - Always null-terminated if buf != NULL and buf_size > 0.
+ *
+ * @param[in] value Input floating-point value
+ * @param[out] buf Output buffer
+ * @param[in] buf_size Size of the output buffer in bytes
+ * @return Number of characters written (excluding '\0') on success, or a negative error code
+ */
+int float_to_str_1dec(float value, char *buf, size_t buf_size);
+
 #ifdef __cplusplus
 }
 #endif

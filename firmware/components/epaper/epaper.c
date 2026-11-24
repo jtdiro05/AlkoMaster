@@ -611,3 +611,107 @@ esp_err_t epaper_sleep(epaper_display_t *display, epaper_sleep_mode_t sleep_mode
     display->is_sleeping = (sleep_mode != SSD1680_SLEEP_MODE_NORMAL);
     return ESP_OK;
 }
+
+int float_to_str_1dec(float value, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) {
+        return FLOAT_TO_STR_ERR_INVALID_ARG;
+    }
+
+    /* IEEE 754 bit-level representation */
+    union {
+        float f;
+        uint32_t u;
+    } pun = { .f = value };
+
+    const uint32_t u = pun.u;
+    const bool sign = (u >> 31) != 0;
+    const uint32_t exp = (u >> 23) & 0xFF;
+    const uint32_t mant = u & 0x7FFFFF;
+
+    /* Handle IEEE 754 special values (NaN, +/-Inf) */
+    if (exp == 0xFF) {
+        if (mant != 0) {
+            /* NaN */
+            if (buf_size < 4) {
+                buf[0] = '\0';
+                return FLOAT_TO_STR_ERR_BUF_TOO_SMALL;
+            }
+            buf[0] = 'n';
+            buf[1] = 'a';
+            buf[2] = 'n';
+            buf[3] = '\0';
+            return FLOAT_TO_STR_ERR_NAN;
+        } else {
+            /* +/- Infinity */
+            if (sign) {
+                if (buf_size < 5) {
+                    buf[0] = '\0';
+                    return FLOAT_TO_STR_ERR_BUF_TOO_SMALL;
+                }
+                buf[0] = '-';
+                buf[1] = 'i';
+                buf[2] = 'n';
+                buf[3] = 'f';
+                buf[4] = '\0';
+            } else {
+                if (buf_size < 4) {
+                    buf[0] = '\0';
+                    return FLOAT_TO_STR_ERR_BUF_TOO_SMALL;
+                }
+                buf[0] = 'i';
+                buf[1] = 'n';
+                buf[2] = 'f';
+                buf[3] = '\0';
+            }
+            return FLOAT_TO_STR_ERR_INF;
+        }
+    }
+
+    double mag = (value < 0.0f) ? -(double)value : (double)value;
+
+    /* Guard against magnitude exceeding uint64_t representation */
+    if (mag > 1e17) {
+        buf[0] = '\0';
+        return FLOAT_TO_STR_ERR_OVERFLOW;
+    }
+
+    /* Round half away from zero with an epsilon compensating for binary float literal inaccuracies */
+    double scaled = mag * 10.0;
+    double eps = scaled * 1e-7;
+    uint64_t total_tenths = (uint64_t)(scaled + 0.5 + eps);
+
+    /* Negative zero check: do not emit '-' if rounded value is 0 */
+    const bool is_negative = sign && (total_tenths != 0);
+
+    uint64_t whole = total_tenths / 10;
+    const uint32_t fraction = (uint32_t)(total_tenths % 10);
+
+    /* Format integer part in reverse order into stack buffer */
+    char temp_digits[24];
+    size_t num_digits = 0;
+    do {
+        temp_digits[num_digits++] = (char)('0' + (whole % 10));
+        whole /= 10;
+    } while (whole > 0);
+
+    /* Required length without '\0': [sign] + num_digits + '.' + fraction */
+    const size_t required_len = (is_negative ? 1 : 0) + num_digits + 2;
+    if (required_len + 1 > buf_size) {
+        buf[0] = '\0';
+        return FLOAT_TO_STR_ERR_BUF_TOO_SMALL;
+    }
+
+    size_t idx = 0;
+    if (is_negative) {
+        buf[idx++] = '-';
+    }
+    while (num_digits > 0) {
+        buf[idx++] = temp_digits[--num_digits];
+    }
+    buf[idx++] = '.';
+    buf[idx++] = (char)('0' + fraction);
+    buf[idx] = '\0';
+
+    return (int)idx;
+}
